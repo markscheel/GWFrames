@@ -177,7 +177,7 @@ def ReadFiniteRadiusData(ChMass=0.0, filename='rh_FiniteRadii_CodeUnits.h5', Coo
         raise
     try :
         # Get list of waveforms we'll be using
-        WaveformNames = list(f)
+        WaveformNames = sorted(list(f))
         if(not CoordRadii) :
             # If the list of Radii is empty, figure out what they are
             CoordRadii = [m.group('r') for Name in WaveformNames for m in [re_compile(r"""R(?P<r>.*?)\.dir""").search(Name)] if m]
