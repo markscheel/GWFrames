@@ -10,11 +10,13 @@
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <gsl/gsl_blas.h>
 #include <gsl/gsl_errno.h>
 #include <gsl/gsl_spline.h>
 #include <gsl/gsl_linalg.h>
 #include <gsl/gsl_multimin.h>
 #include <gsl/gsl_multifit.h>
+#include <gsl/gsl_version.h> // for GSL_MAJOR_VERSION
 #include "Waveforms.hpp"
 #include "Quaternions.hpp"
 #include "Utilities.hpp"
@@ -42,6 +44,282 @@ using std::min;
 using std::max;
 using std::ios_base;
 using std::complex;
+
+#if GSL_MAJOR_VERSION > 1
+// NOTE: GSL version 2 eliminated gsl_multifit_linear_usvd.  However,
+// this function is easy to reproduce by simply passing in zero for
+// the 'balance' parameter in multifit_linear_svd.  So the following
+// is a copy of gsl_multifit_linear and related code from GSL version
+// 2.3. Below in this unnamed namespace you will find:
+// 1) A copy of gsl_multifit_linear_tsvd, renamed
+//    gsl_multifit_linear_tsvd_modified, and with ONLY ONE CHARACTER
+//    OF SOURCE CODE MODIFIED, as commented below, so that unbalanced
+//    svd is used.
+// 2) A copy of multifit_linear_solve with NO MODIFICATIONS.  This was
+//    necessary because in the gsl source code, multifit_linear_solve.c is
+//    #included into multifit/multilinear.c rather than being compiled on
+//    its own, so there's not a good way to access this code.
+// 3) There's a small wrapper function called gsl_multifit_linear_svd
+//    with the same calling sequence as the old gsl_multifit_linear_usvd.
+
+/* multifit/multilinear.c
+ * 
+ * Copyright (C) 2000, 2007, 2010 Brian Gough
+ * Copyright (C) 2013, 2015 Patrick Alken
+ * 
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or (at
+ * your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ */
+namespace{
+  static int
+    multifit_linear_solve (const gsl_matrix * X,
+                           const gsl_vector * y,
+                           const double tol,
+                           const double lambda,
+                           size_t * rank,
+                           gsl_vector * c,
+                           double *rnorm,
+                           double *snorm,
+                           gsl_multifit_linear_workspace * work)
+  {
+    const size_t n = X->size1;
+    const size_t p = X->size2;
+    
+    if (n != work->n || p != work->p)
+      {
+        GSL_ERROR("observation matrix does not match workspace", GSL_EBADLEN);
+      }
+    else if (n != y->size)
+      {
+        GSL_ERROR("number of observations in y does not match matrix",
+                  GSL_EBADLEN);
+      }
+    else if (p != c->size)
+      {
+        GSL_ERROR ("number of parameters c does not match matrix",
+                   GSL_EBADLEN);
+      }
+    else if (tol <= 0)
+      {
+        GSL_ERROR ("tolerance must be positive", GSL_EINVAL);
+      }
+    else
+      {
+        const double lambda_sq = lambda * lambda;
+
+        double rho_ls = 0.0;     /* contribution to rnorm from OLS */
+        
+      size_t j, p_eff;
+      
+      /* these inputs are previously computed by multifit_linear_svd() */
+      gsl_matrix_view A = gsl_matrix_submatrix(work->A, 0, 0, n, p);
+      gsl_matrix_view Q = gsl_matrix_submatrix(work->Q, 0, 0, p, p);
+      gsl_vector_view S = gsl_vector_subvector(work->S, 0, p);
+      
+      /* workspace */
+      gsl_matrix_view QSI = gsl_matrix_submatrix(work->QSI, 0, 0, p, p);
+      gsl_vector_view xt = gsl_vector_subvector(work->xt, 0, p);
+      gsl_vector_view D = gsl_vector_subvector(work->D, 0, p);
+      gsl_vector_view t = gsl_vector_subvector(work->t, 0, n);
+      
+      /*
+       * Solve y = A c for c
+       * c = Q diag(s_i / (s_i^2 + lambda_i^2)) U^T y
+       */
+      
+      /* compute xt = U^T y */
+      gsl_blas_dgemv (CblasTrans, 1.0, &A.matrix, y, 0.0, &xt.vector);
+      
+      if (n > p)
+        {
+          /*
+           * compute OLS residual norm = || y - U U^T y ||;
+           * for n = p, U U^T = I, so no need to calculate norm
+           */
+          gsl_vector_memcpy(&t.vector, y);
+          gsl_blas_dgemv(CblasNoTrans, -1.0, &A.matrix, &xt.vector, 1.0, &t.vector);
+          rho_ls = gsl_blas_dnrm2(&t.vector);
+        }
+      
+      if (lambda > 0.0)
+        {
+          /* xt <-- [ s(i) / (s(i)^2 + lambda^2) ] .* U^T y */
+          for (j = 0; j < p; ++j)
+            {
+              double sj = gsl_vector_get(&S.vector, j);
+              double f = (sj * sj) / (sj * sj + lambda_sq);
+              double *ptr = gsl_vector_ptr(&xt.vector, j);
+              
+              /* use D as workspace for residual norm */
+              gsl_vector_set(&D.vector, j, (1.0 - f) * (*ptr));
+              
+              *ptr *= sj / (sj*sj + lambda_sq);
+            }
+          
+          /* compute regularized solution vector */
+          gsl_blas_dgemv (CblasNoTrans, 1.0, &Q.matrix, &xt.vector, 0.0, c);
+          
+          /* compute solution norm */
+          *snorm = gsl_blas_dnrm2(c);
+          
+          /* compute residual norm */
+          *rnorm = gsl_blas_dnrm2(&D.vector);
+          
+          if (n > p)
+            {
+              /* add correction to residual norm (see eqs 6-7 of [1]) */
+              *rnorm = sqrt((*rnorm) * (*rnorm) + rho_ls * rho_ls);
+            }
+          
+          /* reset D vector */
+          gsl_vector_set_all(&D.vector, 1.0);
+        }
+      else
+        {
+          /* Scale the matrix Q, QSI = Q S^{-1} */
+          
+          gsl_matrix_memcpy (&QSI.matrix, &Q.matrix);
+          
+          {
+            double s0 = gsl_vector_get (&S.vector, 0);
+            p_eff = 0;
+            
+            for (j = 0; j < p; j++)
+              {
+                gsl_vector_view column = gsl_matrix_column (&QSI.matrix, j);
+                double sj = gsl_vector_get (&S.vector, j);
+                double alpha;
+
+                if (sj <= tol * s0)
+                  {
+                    alpha = 0.0;
+                  }
+                else
+                  {
+                    alpha = 1.0 / sj;
+                    p_eff++;
+                  }
+                
+                gsl_vector_scale (&column.vector, alpha);
+              }
+            
+            *rank = p_eff;
+          }
+          
+          gsl_blas_dgemv (CblasNoTrans, 1.0, &QSI.matrix, &xt.vector, 0.0, c);
+          
+          /* Unscale the balancing factors */
+          gsl_vector_div (c, &D.vector);
+          
+          *snorm = gsl_blas_dnrm2(c);
+          *rnorm = rho_ls;
+        }
+      
+      return GSL_SUCCESS;
+      }
+  }
+
+  int
+    gsl_multifit_linear_tsvd_modified(const gsl_matrix * X,
+                                      const gsl_vector * y,
+                                      const double tol,
+                                      gsl_vector * c,
+                                      gsl_matrix * cov,
+                                      double * chisq,
+                                      size_t * rank,
+                                      gsl_multifit_linear_workspace * work)
+  {
+    const size_t n = X->size1;
+    const size_t p = X->size2;
+    
+    if (y->size != n)
+      {
+        GSL_ERROR("number of observations in y does not match matrix",
+                  GSL_EBADLEN);
+      }
+    else if (p != c->size)
+      {
+        GSL_ERROR ("number of parameters c does not match matrix",
+                   GSL_EBADLEN);
+      }
+    else if (tol <= 0)
+      {
+        GSL_ERROR ("tolerance must be positive", GSL_EINVAL);
+      }
+    else
+      {
+        int status;
+        double rnorm = 0.0, snorm;
+        
+        /* MODIFICATION by M. Scheel June 27 2017: use UNBALANCED SVD */
+        /* The change was gsl_multifit_linear_bsvd -> gsl_multifit_linear_svd */
+        status = gsl_multifit_linear_svd (X, work);
+        if (status)
+          return status;
+        
+        status = multifit_linear_solve (X, y, tol, -1.0, rank,
+                                        c, &rnorm, &snorm, work);
+        
+        *chisq = rnorm * rnorm;
+        
+      /* variance-covariance matrix cov = s2 * (Q S^-1) (Q S^-1)^T */
+        {
+          double r2 = rnorm * rnorm;
+          double s2 = r2 / (double)(n - *rank);
+          size_t i, j;
+          gsl_matrix_view QSI = gsl_matrix_submatrix(work->QSI, 0, 0, p, p);
+          gsl_vector_view D = gsl_vector_subvector(work->D, 0, p);
+          
+          for (i = 0; i < p; i++)
+            {
+              gsl_vector_view row_i = gsl_matrix_row (&QSI.matrix, i);
+              double d_i = gsl_vector_get (&D.vector, i);
+              
+              for (j = i; j < p; j++)
+                {
+                  gsl_vector_view row_j = gsl_matrix_row (&QSI.matrix, j);
+                  double d_j = gsl_vector_get (&D.vector, j);
+                  double s;
+                  
+                  gsl_blas_ddot (&row_i.vector, &row_j.vector, &s);
+                  
+                  gsl_matrix_set (cov, i, j, s * s2 / (d_i * d_j));
+                  gsl_matrix_set (cov, j, i, s * s2 / (d_i * d_j));
+                }
+            }
+        }
+        
+        return status;
+      }
+  }
+
+  int
+    gsl_multifit_linear_usvd(const gsl_matrix * X,
+                             const gsl_vector * y,
+                             double tol, size_t * rank,
+                             gsl_vector * c,
+                             gsl_matrix * cov,
+                             double *chisq,
+                             gsl_multifit_linear_workspace * work)
+  {
+    int status = gsl_multifit_linear_tsvd_modified(X, y, tol, c,
+                                                   cov, chisq, rank, work);
+    
+    return status;
+  }
+} // namespace
+#endif
 
 
 const LadderOperatorFactorFunctor LadderOperatorFactor;
